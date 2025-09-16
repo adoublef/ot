@@ -13,23 +13,22 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-type Device struct {
-	ID   uuid.UUID `json:"id" db:"id"`
-	Meta Metadata  `json:"metadata" db:"metadata"`
-}
-
 type DB struct {
 	RWC *sqlx.DB
 }
 
+type Device struct {
+	ID       uuid.UUID `db:"id"`
+	Metadata Metadata  `db:"metadata"`
+}
+
 func (d *DB) Device(ctx context.Context, id uuid.UUID) (Device, error) {
 	var found Device
-	err := d.RWC.QueryRowxContext(ctx, "select d.id, d.metadata from iot.device d where d.id = $1", id).StructScan(&found)
+	err := d.RWC.QueryRowxContext(ctx, "select d.id, d.metadata from ot.device d where d.id = $1", id).StructScan(&found)
 	return found, err
 }
 
 type Metadata struct {
-	Blob     []byte    `json:"blob,omitempty"`
 	LastSeen time.Time `json:"lastSeen"`
 }
 
@@ -64,7 +63,7 @@ func (d *DB) AddDevice(ctx context.Context, m Metadata) (uuid.UUID, error) {
 		ID:       id,
 		Metadata: m,
 	}
-	_, err := d.RWC.NamedExecContext(ctx, "insert into iot.device (id, metadata) values (:id, :metadata)", arg)
+	_, err := d.RWC.NamedExecContext(ctx, "insert into ot.device (id, metadata) values (:id, :metadata)", arg)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -79,7 +78,7 @@ func (d *DB) ModDevice(ctx context.Context, id uuid.UUID, m Metadata) error {
 		ID:       id,
 		Metadata: m,
 	}
-	ct, err := d.RWC.NamedExecContext(ctx, "update iot.device set metadata = :metadata where id = :id", arg)
+	ct, err := d.RWC.NamedExecContext(ctx, "update ot.device set metadata = :metadata where id = :id", arg)
 	if hasErr := cmp.Or(err != nil, omit(ct.RowsAffected()) < 1); hasErr {
 		return cmp.Or(err, sql.ErrNoRows)
 	}

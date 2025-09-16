@@ -26,5 +26,5 @@ func Test_DB(t *testing.T) {
 	dev, err := db.Device(t.Context(), id)
 	is.OK(t, err) // DB.Device
 
-	is.Equal(t, dev.Meta.LastSeen, m.LastSeen) // +1 day
+	is.Equal(t, dev.Metadata.LastSeen, m.LastSeen) // +1 day
 }
