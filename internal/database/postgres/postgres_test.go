@@ -1,51 +1,56 @@
-package main
+// Copyright The IOT Authors 2025. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package postgres_test
 
 import (
 	"context"
 	"database/sql"
-	"flag"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
+	. "github.com/adoublef/ot/internal/database/postgres"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 	"github.com/testcontainers/testcontainers-go"
 	"go.adoublef.dev/runtime/container/postgres"
 	"go.adoublef.dev/testing/is"
-	"golang.org/x/sync/errgroup"
 )
 
-var maxConns int
+func TestUp(t *testing.T) {
+	ctx := t.Context()
 
-func init() {
-	flag.IntVar(&maxConns, "db.conns", 1, "database connections")
+	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	is.OK(t, err) // container.ConnectionString
+
+	is.OK(t, Up(ctx, dsn))   // Up
+	is.OK(t, Down(ctx, dsn)) // Down
 }
 
-func Test(t *testing.T) {
-	t.Run("Block", func(t *testing.T) {
+func TestMaxConn(t *testing.T) {
+	sleep := func(ctx context.Context, d *sqlx.DB, timeout int) error {
+		_, err := d.ExecContext(ctx, "select pg_sleep($1)", timeout)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	trace := func(t testing.TB, start time.Time) {
+		t.Helper()
+		elapsed := time.Since(start)
+		t.Logf("%s (%s)", t.Name(), elapsed)
+	}
+
+	t.Run("One", func(t *testing.T) {
 		var (
 			d = newPool(t, 1)
-		)
-
-		numOfQueries := 4
-
-		var wg sync.WaitGroup
-		wg.Add(numOfQueries)
-		for range numOfQueries {
-			go func() {
-				defer func(start time.Time) { wg.Done(); trace(t, start) }(time.Now())
-				sleep(t.Context(), d, 1)
-			}()
-		}
-		wg.Wait()
-	})
-
-	t.Run("NonBlock", func(t *testing.T) {
-		var (
-			d = newPool(t, 4)
 		)
 
 		numOfQueries := 4
@@ -83,27 +88,31 @@ func Test(t *testing.T) {
 		}
 		wg.Wait()
 	})
-}
 
-func sleep(ctx context.Context, d *sqlx.DB, timeout int) error {
-	_, err := d.ExecContext(ctx, "select pg_sleep($1)", timeout)
-	if err != nil {
-		return err
-	}
-	return nil
-}
+	t.Run("Pool", func(t *testing.T) {
+		var (
+			d = newPool(t, 4)
+		)
 
-func trace(t testing.TB, start time.Time) {
-	t.Helper()
-	elapsed := time.Since(start)
-	t.Logf("%s (%s)", t.Name(), elapsed)
+		numOfQueries := 4
+
+		var wg sync.WaitGroup
+		wg.Add(numOfQueries)
+		for range numOfQueries {
+			go func() {
+				defer func(start time.Time) { wg.Done(); trace(t, start) }(time.Now())
+				sleep(t.Context(), d, 1)
+			}()
+		}
+		wg.Wait()
+	})
 }
 
 func newPool(t testing.TB, maxConns int) *sqlx.DB {
 	t.Helper()
 	ctx := t.Context()
 
-	dsn, err := postgresContainer.ConnectionString(ctx, "sslmode=disable")
+	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
 	is.OK(t, err) // postgresContainer.ConnectionString
 
 	db, err := sql.Open("postgres", dsn)
@@ -135,26 +144,24 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-var postgresContainer *postgres.Container
+var container *postgres.Container
 
 // setup initialises containers within the pacakge.
-func setup(ctx context.Context) error {
-	g, ctx := errgroup.WithContext(ctx)
-	g.Go(func() (err error) {
-		postgresContainer, err = postgres.Run(ctx, "")
+func setup(ctx context.Context) (err error) {
+	container, err = postgres.Run(ctx, "")
+	if err != nil {
 		return
-	})
-	return g.Wait()
+	}
+	return
 }
 
 // cleanup stops all running containers for the pacakge.
 func cleanup(ctx context.Context) (err error) {
-	g := new(errgroup.Group)
-	var cc = []testcontainers.Container{postgresContainer}
+	var cc = []testcontainers.Container{container}
 	for _, c := range cc {
-		// if c != nil {
-		g.Go(func() error { return c.Terminate(ctx) })
-		// }
+		if c != nil {
+			err = errors.Join(err, c.Terminate(ctx))
+		}
 	}
-	return g.Wait()
+	return err
 }
