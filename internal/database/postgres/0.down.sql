@@ -1,1 +1,1 @@
-drop schema iot cascade;
+drop schema ot cascade;
