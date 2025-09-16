@@ -10,9 +10,10 @@ import (
 	"github.com/adoublef/ot/internal/device"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
-	"go.adoublef.dev/runtime/debug"
 	"golang.org/x/sync/errgroup"
 )
+
+type MsgHandler func(ctx context.Context, msg *nats.Msg)
 
 type Conn = nats.Conn
 
@@ -20,13 +21,19 @@ func Connect(url string) (*nats.Conn, error) {
 	return nats.Connect(url)
 }
 
-var defaultTimeout = 100 * time.Millisecond
+func Handler(nc *nats.Conn, db *device.DB, subCount int) error {
+	handleMsg := func(h MsgHandler) nats.MsgHandler {
+		return func(msg *nats.Msg) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+			defer cancel()
+			/* err :=  */ h(ctx, msg)
+		}
+	}
 
-func Handler(nc *nats.Conn, db *device.DB) error {
 	g := new(errgroup.Group)
 	g.Go(func() error {
-		for range 1 {
-			_, err := nc.QueueSubscribe("ping", "queue", handlePing(db))
+		for range subCount {
+			_, err := nc.QueueSubscribe("ping", "queue", handleMsg(handlePing(db)))
 			return err
 		}
 		return nil
@@ -37,24 +44,22 @@ func Handler(nc *nats.Conn, db *device.DB) error {
 	return nil
 }
 
-func handlePing(db *device.DB) nats.MsgHandler {
-	return func(msg *nats.Msg) {
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-		defer cancel()
-
+func handlePing(db *device.DB) MsgHandler {
+	panicf := func(format string, v ...any) { panic(fmt.Sprintf(format, v...)) }
+	return func(ctx context.Context, msg *nats.Msg) {
 		var v struct {
 			ID       uuid.UUID `json:"id"`
 			LastSeen time.Time `json:"lastSeen"`
 		}
 		err1 := json.Unmarshal(msg.Data, &v)
 		d, err2 := db.Device(ctx, v.ID)
-		if v.LastSeen.Before(d.Meta.LastSeen) {
-			panic("server received invalid last seen")
+		if v.LastSeen.Before(d.Metadata.LastSeen) {
+			panicf("server received invalid last seen")
 		}
-		d.Meta.LastSeen = v.LastSeen
-		err3 := db.ModDevice(ctx, d.ID, d.Meta)
+		d.Metadata.LastSeen = v.LastSeen
+		err3 := db.ModDevice(ctx, d.ID, d.Metadata)
 		if err := cmp.Or(err1, err2, err3); err != nil {
-			debug.Printf("failed to process handlePing message: %v", err)
+			panicf("failed to process handlePing message: %v", err)
 		}
 	}
 }
