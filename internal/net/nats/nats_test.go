@@ -3,10 +3,13 @@ package nats_test
 import (
 	"cmp"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"iter"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +29,7 @@ var testConfig struct {
 	pubCount int
 	subCount int
 	dbCount  int
+	blobSize int
 }
 
 func init() {
@@ -35,6 +39,7 @@ func init() {
 	flag.IntVar(&testConfig.pubLimit, "pub.limit", 1, "publisher limit")
 	flag.IntVar(&testConfig.subCount, "sub.count", 1, "subscriber count")
 	flag.IntVar(&testConfig.dbCount, "db.count", 1, "database count")
+	flag.IntVar(&testConfig.blobSize, "blob.size", 0, "blob size")
 }
 
 func TestConsume(t *testing.T) {
@@ -46,38 +51,58 @@ func TestConsume(t *testing.T) {
 		nc = newNATS(t, db, testConfig.subCount)
 
 		firstSeen = time.Date(2009, time.November, 10, 0, 0, 0, 0, time.UTC)
+
+		ctx = t.Context()
 	)
 
-	ids, sends := send(t.Context(), db, nc, testConfig.pubCount, testConfig.pubLimit, testConfig.msgCount, testConfig.msgLimit, firstSeen)
-	polls := poll(t.Context(), ids, db, testConfig.pubLimit, testConfig.msgCount, firstSeen)
-	is.OK(t, cmp.Or(sends.Wait(), polls.Wait()))
+	ids, r0, sends := send(ctx, db, nc, testConfig.pubCount, testConfig.pubLimit, testConfig.msgCount, testConfig.msgLimit, firstSeen)
+	r1, polls := poll(ctx, ids, db, testConfig.pubLimit, testConfig.msgCount, firstSeen)
+	err := writeTo(io.Discard, merge(r0, r1))
+	is.OK(t, cmp.Or(sends.Wait(), polls.Wait(), err))
 }
 
-func poll(ctx context.Context, ids <-chan uuid.UUID, db *device.DB, pubLimit, msgCount int, firstSeen time.Time) *errgroup.Group {
+func poll(ctx context.Context, ids <-chan uuid.UUID, db *device.DB, pubLimit, msgCount int, firstSeen time.Time) (<-chan []string, *errgroup.Group) {
+	records := make(chan []string, pubLimit)
 	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(pubLimit)
-	for id := range ids {
-		g.Go(func() error {
-			return wait.ForFunc(ctx, time.Second*60, func() error {
-				d, err := db.Device(ctx, id)
+	g.Go(func() error {
+		defer func() { close(records) }()
+
+		g, ctx := errgroup.WithContext(ctx)
+		g.SetLimit(pubLimit)
+		for id := range ids {
+			g.Go(func() error {
+				err := wait.ForFunc(ctx, time.Second*60, func() error {
+					d, err := db.Device(ctx, id)
+					if err != nil {
+						return wait.SkipRetry // not found
+					}
+					if !d.Metadata.LastSeen.Equal(firstSeen.AddDate(0, 0, msgCount)) {
+						return fmt.Errorf("device %s not ready", id)
+					}
+					return nil
+				})
 				if err != nil {
-					return wait.SkipRetry // not found
+					return err
 				}
-				if !d.Metadata.LastSeen.Equal(firstSeen.AddDate(0, 0, msgCount)) {
-					return fmt.Errorf("device %s not ready", id)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case records <- []string{"poll", id.String()}:
 				}
 				return nil
 			})
-		})
-	}
-	return g
+		}
+		return g.Wait()
+	})
+	return records, g
 }
 
-func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit, msgCount, msgLimit int, firstSeen time.Time) (<-chan uuid.UUID, *errgroup.Group) {
-	ch := make(chan uuid.UUID)
+func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit, msgCount, msgLimit int, firstSeen time.Time) (<-chan uuid.UUID, <-chan []string, *errgroup.Group) {
+	ids := make(chan uuid.UUID, pubLimit)
+	records := make(chan []string, pubLimit*msgLimit)
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		defer close(ch)
+		defer func() { close(ids); close(records) }()
 
 		g, ctx := errgroup.WithContext(ctx)
 		// if one device we still need to send
@@ -95,7 +120,7 @@ func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit,
 				g, ctx := errgroup.WithContext(ctx)
 				g.SetLimit(msgLimit)
 				for day := 1; day <= msgCount; day++ {
-					g.Go(func() error {
+					g.Go(func() error { // context canceled
 						v := struct {
 							ID       uuid.UUID `json:"id"`
 							LastSeen time.Time `json:"lastSeen"`
@@ -106,20 +131,28 @@ func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit,
 						}
 						p, err1 := json.Marshal(v)
 						err2 := nc.Publish("ping", p)
-						return cmp.Or(err1, err2, ctx.Err())
+						if err := cmp.Or(err1, err2, ctx.Err()); err != nil {
+							return err
+						}
+						select {
+						case <-ctx.Done():
+							return ctx.Err()
+						case records <- []string{"send", id.String()}:
+						}
+						return nil
 					})
 				}
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case ch <- id:
+				case ids <- id:
 				}
-				return nil
+				return g.Wait()
 			})
 		}
 		return g.Wait()
 	})
-	return ch, g
+	return ids, records, g
 }
 
 func devices(ctx context.Context, d *device.DB, pubCount int, firstSeen time.Time) iter.Seq2[uuid.UUID, error] {
@@ -131,4 +164,43 @@ func devices(ctx context.Context, d *device.DB, pubCount int, firstSeen time.Tim
 			}
 		}
 	}
+}
+
+func writeTo(w io.Writer, records <-chan []string) error {
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{"type", "id"}); err != nil {
+		return err
+	}
+	for record := range records {
+		if err := cw.Write(record); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+// https://go.dev/blog/pipelines#fan-out-fan-in
+func merge[V any](cs ...<-chan V) <-chan V {
+	var wg sync.WaitGroup
+	out := make(chan V)
+	// Start an output goroutine for each input channel in cs.  output
+	// copies values from c to out until c is closed, then calls wg.Done.
+	output := func(c <-chan V) {
+		for n := range c {
+			out <- n
+		}
+		wg.Done()
+	}
+	wg.Add(len(cs))
+	for _, c := range cs {
+		go output(c)
+	}
+	// Start a goroutine to close out once all the output goroutines are
+	// done.  This must start after the wg.Add call.
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
 }
