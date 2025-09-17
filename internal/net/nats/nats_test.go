@@ -3,6 +3,8 @@ package nats_test
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -22,41 +24,43 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var testConfig struct {
-	msgCount int
-	msgLimit int
-	pubLimit int
-	pubCount int
-	subCount int
-	dbCount  int
-	blobSize int
+var tc struct {
+	msgCount   int
+	msgLimit   int
+	pubLimit   int
+	pubCount   int
+	subCount   int
+	subTimeout time.Duration
+	dbCount    int
+	blobSize   int
 }
 
 func init() {
-	flag.IntVar(&testConfig.msgCount, "msg.count", 1, "message count")
-	flag.IntVar(&testConfig.msgLimit, "msg.limit", 1, "message limit")
-	flag.IntVar(&testConfig.pubCount, "pub.count", 1, "publisher count")
-	flag.IntVar(&testConfig.pubLimit, "pub.limit", 1, "publisher limit")
-	flag.IntVar(&testConfig.subCount, "sub.count", 1, "subscriber count")
-	flag.IntVar(&testConfig.dbCount, "db.count", 1, "database count")
-	flag.IntVar(&testConfig.blobSize, "blob.size", 0, "blob size")
+	flag.IntVar(&tc.msgCount, "msg.count", 1, "message count")
+	flag.IntVar(&tc.msgLimit, "msg.limit", 1, "message limit")
+	flag.IntVar(&tc.pubCount, "pub.count", 1, "publisher count")
+	flag.IntVar(&tc.pubLimit, "pub.limit", 1, "publisher limit")
+	flag.IntVar(&tc.subCount, "sub.count", 1, "subscriber count")
+	flag.DurationVar(&tc.subTimeout, "sub.timeout", time.Millisecond*100, "subscriber timeout")
+	flag.IntVar(&tc.dbCount, "db.count", 1, "database count")
+	flag.IntVar(&tc.blobSize, "blob.size", 0, "blob size")
 }
 
 func TestConsume(t *testing.T) {
-	t.Logf("%s/testConfig%+v", t.Name(), testConfig)
+	t.Logf("%s/testConfig%+v", t.Name(), tc)
 
 	var (
-		p  = newPool(t, testConfig.dbCount)
+		p  = newPool(t, tc.dbCount)
 		db = &device.DB{RWC: p}
-		nc = newNATS(t, db, testConfig.subCount)
+		nc = newNATS(t, db, tc.subCount, tc.subTimeout)
 
 		firstSeen = time.Date(2009, time.November, 10, 0, 0, 0, 0, time.UTC)
 
 		ctx = t.Context()
 	)
 
-	ids, r0, sends := send(ctx, db, nc, testConfig.pubCount, testConfig.pubLimit, testConfig.msgCount, testConfig.msgLimit, firstSeen)
-	r1, polls := poll(ctx, ids, db, testConfig.pubLimit, testConfig.msgCount, firstSeen)
+	ids, r0, sends := send(ctx, db, nc, tc.pubCount, tc.pubLimit, tc.msgCount, tc.msgLimit, tc.blobSize, firstSeen)
+	r1, polls := poll(ctx, ids, db, tc.pubLimit, tc.msgCount, firstSeen)
 	err := writeTo(io.Discard, merge(r0, r1))
 	is.OK(t, cmp.Or(sends.Wait(), polls.Wait(), err))
 }
@@ -97,7 +101,7 @@ func poll(ctx context.Context, ids <-chan uuid.UUID, db *device.DB, pubLimit, ms
 	return records, g
 }
 
-func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit, msgCount, msgLimit int, firstSeen time.Time) (<-chan uuid.UUID, <-chan []string, *errgroup.Group) {
+func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit, msgCount, msgLimit, blobSize int, firstSeen time.Time) (<-chan uuid.UUID, <-chan []string, *errgroup.Group) {
 	ids := make(chan uuid.UUID, pubLimit)
 	records := make(chan []string, pubLimit*msgLimit)
 	g, ctx := errgroup.WithContext(ctx)
@@ -110,7 +114,7 @@ func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit,
 		// how many should we process at once?
 		// with 10 devices do we need 10 routines? maybe not
 		g.SetLimit(pubLimit)
-		for id, err := range devices(ctx, db, pubCount, firstSeen) {
+		for id, err := range devices(ctx, db, pubCount, blobSize, firstSeen) {
 			// we want to check context before the next stage
 			// more verbose, but best we can do when not using jetstream
 			g.Go(func() error {
@@ -155,10 +159,20 @@ func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit,
 	return ids, records, g
 }
 
-func devices(ctx context.Context, d *device.DB, pubCount int, firstSeen time.Time) iter.Seq2[uuid.UUID, error] {
+func devices(ctx context.Context, d *device.DB, pubCount, blobSize int, firstSeen time.Time) iter.Seq2[uuid.UUID, error] {
+	buf := make([]byte, blobSize)
+	n, err := rand.Read(buf)
+	if err != nil {
+		panic("failed to read")
+	}
+	encodedLen := base64.StdEncoding.EncodedLen(len(buf))
+	blob := make([]byte, encodedLen)
+	base64.StdEncoding.Encode(blob, buf[:n])
+	// 3mb takes longer to query & modify under 100ms
+	// 4mb takes longer to query & modify under 250ms
 	return func(yield func(uuid.UUID, error) bool) {
 		for range pubCount {
-			id, err := d.AddDevice(ctx, device.Metadata{LastSeen: firstSeen})
+			id, err := d.AddDevice(ctx, device.Metadata{Blob: blob, LastSeen: firstSeen})
 			if !yield(id, err) {
 				return
 			}
@@ -187,10 +201,10 @@ func merge[V any](cs ...<-chan V) <-chan V {
 	// Start an output goroutine for each input channel in cs.  output
 	// copies values from c to out until c is closed, then calls wg.Done.
 	output := func(c <-chan V) {
+		defer wg.Done()
 		for n := range c {
 			out <- n
 		}
-		wg.Done()
 	}
 	wg.Add(len(cs))
 	for _, c := range cs {

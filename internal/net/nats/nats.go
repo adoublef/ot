@@ -21,10 +21,14 @@ func Connect(url string) (*nats.Conn, error) {
 	return nats.Connect(url)
 }
 
-func Handler(nc *nats.Conn, db *device.DB, subCount int) error {
+func Handler(nc *nats.Conn, db *device.DB, subCount int, subTimeout time.Duration) error {
+	if subCount < 1 {
+		panic("subCount not set")
+	}
+
 	handleMsg := func(h MsgHandler) nats.MsgHandler {
 		return func(msg *nats.Msg) {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+			ctx, cancel := context.WithTimeout(context.Background(), subTimeout)
 			defer cancel()
 			/* err :=  */ h(ctx, msg)
 		}
@@ -56,6 +60,7 @@ func handlePing(db *device.DB) MsgHandler {
 		if v.LastSeen.Before(d.Metadata.LastSeen) {
 			panicf("server received invalid last seen")
 		}
+		// debug.Printf("len(d.Metadata.Blob) = %d", len(d.Metadata.Blob))
 		d.Metadata.LastSeen = v.LastSeen
 		err3 := db.ModDevice(ctx, d.ID, d.Metadata)
 		if err := cmp.Or(err1, err2, err3); err != nil {

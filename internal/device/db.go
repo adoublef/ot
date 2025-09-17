@@ -29,6 +29,7 @@ func (d *DB) Device(ctx context.Context, id uuid.UUID) (Device, error) {
 }
 
 type Metadata struct {
+	Blob     []byte    `json:"blob"`
 	LastSeen time.Time `json:"lastSeen"`
 }
 
@@ -79,12 +80,10 @@ func (d *DB) ModDevice(ctx context.Context, id uuid.UUID, m Metadata) error {
 		Metadata: m,
 	}
 	ct, err := d.RWC.NamedExecContext(ctx, "update ot.device set metadata = :metadata where id = :id", arg)
-	if hasErr := cmp.Or(err != nil, omit(ct.RowsAffected()) < 1); hasErr {
+	if err != nil {
+		return err
+	} else if n, err := ct.RowsAffected(); err != nil || n < 1 {
 		return cmp.Or(err, sql.ErrNoRows)
 	}
 	return nil
-}
-
-func omit[V any](v V, _ error) V {
-	return v
 }

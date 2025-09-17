@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	migrate "github.com/adoublef/ot/internal/database/postgres"
 	"github.com/adoublef/ot/internal/device"
@@ -20,7 +21,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func newNATS(t testing.TB, db *device.DB, subCount int) *nats.Conn {
+func newNATS(t testing.TB, db *device.DB, subCount int, subTimeout time.Duration) *nats.Conn {
 	t.Helper()
 
 	ns := servertest.RunServer(&server.Options{Debug: testing.Verbose()})
@@ -32,7 +33,7 @@ func newNATS(t testing.TB, db *device.DB, subCount int) *nats.Conn {
 	is.OK(t, err) // Connect
 	t.Cleanup(func() { is.OK(t, nc.Drain()) /* Drain */ })
 
-	is.OK(t, nats.Handler(nc, db, subCount)) // Handler
+	is.OK(t, nats.Handler(nc, db, subCount, subTimeout)) // Handler
 
 	return nc
 }
