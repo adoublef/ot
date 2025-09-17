@@ -10,6 +10,7 @@ import (
 	"github.com/adoublef/ot/internal/device"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+	"go.adoublef.dev/runtime/debug"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -50,6 +51,7 @@ func Handler(nc *nats.Conn, db *device.DB, subCount int, subTimeout time.Duratio
 
 func handlePing(db *device.DB) MsgHandler {
 	panicf := func(format string, v ...any) { panic(fmt.Sprintf(format, v...)) }
+	logf := func(format string, v ...any) { debug.Printf(format, v...) }
 	return func(ctx context.Context, msg *nats.Msg) {
 		var v struct {
 			ID       uuid.UUID `json:"id"`
@@ -58,7 +60,8 @@ func handlePing(db *device.DB) MsgHandler {
 		err1 := json.Unmarshal(msg.Data, &v)
 		d, err2 := db.Device(ctx, v.ID)
 		if v.LastSeen.Before(d.Metadata.LastSeen) {
-			panicf("server received invalid last seen")
+			logf("server received message out of order")
+			return
 		}
 		// debug.Printf("len(d.Metadata.Blob) = %d", len(d.Metadata.Blob))
 		d.Metadata.LastSeen = v.LastSeen
