@@ -59,15 +59,18 @@ func TestConsume(t *testing.T) {
 		ctx = t.Context()
 	)
 
-	ids, r0, sends := send(ctx, db, nc, tc.pubCount, tc.pubLimit, tc.msgCount, tc.msgLimit, tc.blobSize, firstSeen)
-	r1, polls := poll(ctx, ids, db, tc.pubLimit, tc.msgCount, firstSeen)
-	err := writeTo(io.Discard, merge(r0, r1))
-	is.OK(t, cmp.Or(sends.Wait(), polls.Wait(), err))
+	g, ctx := errgroup.WithContext(ctx)
+
+	ids, sends := send(ctx, g, db, nc, tc.pubCount, tc.pubLimit, tc.msgCount, tc.msgLimit, tc.blobSize, firstSeen)
+	polls := poll(ctx, g, ids, db, tc.pubLimit, tc.msgCount, firstSeen)
+
+	records := merge(sends, polls)
+	err := writeTo(io.Discard, records)
+	is.OK(t, cmp.Or(g.Wait(), err))
 }
 
-func poll(ctx context.Context, ids <-chan uuid.UUID, db *device.DB, pubLimit, msgCount int, firstSeen time.Time) (<-chan []string, *errgroup.Group) {
+func poll(ctx context.Context, g *errgroup.Group, ids <-chan uuid.UUID, db *device.DB, pubLimit, msgCount int, firstSeen time.Time) <-chan []string {
 	records := make(chan []string, pubLimit)
-	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		defer func() { close(records) }()
 
@@ -98,13 +101,12 @@ func poll(ctx context.Context, ids <-chan uuid.UUID, db *device.DB, pubLimit, ms
 		}
 		return g.Wait()
 	})
-	return records, g
+	return records
 }
 
-func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit, msgCount, msgLimit, blobSize int, firstSeen time.Time) (<-chan uuid.UUID, <-chan []string, *errgroup.Group) {
+func send(ctx context.Context, g *errgroup.Group, db *device.DB, nc *nats.Conn, pubCount, pubLimit, msgCount, msgLimit, blobSize int, firstSeen time.Time) (<-chan uuid.UUID, <-chan []string) {
 	ids := make(chan uuid.UUID, pubLimit)
 	records := make(chan []string, pubLimit*msgLimit)
-	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		defer func() { close(ids); close(records) }()
 
@@ -156,7 +158,7 @@ func send(ctx context.Context, db *device.DB, nc *nats.Conn, pubCount, pubLimit,
 		}
 		return g.Wait()
 	})
-	return ids, records, g
+	return ids, records
 }
 
 func devices(ctx context.Context, d *device.DB, pubCount, blobSize int, firstSeen time.Time) iter.Seq2[uuid.UUID, error] {

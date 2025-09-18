@@ -63,7 +63,6 @@ func handlePing(db *device.DB) MsgHandler {
 			logf("server received message out of order")
 			return
 		}
-		// debug.Printf("len(d.Metadata.Blob) = %d", len(d.Metadata.Blob))
 		d.Metadata.LastSeen = v.LastSeen
 		err3 := db.ModDevice(ctx, d.ID, d.Metadata)
 		if err := cmp.Or(err1, err2, err3); err != nil {
