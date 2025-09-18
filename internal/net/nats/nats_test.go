@@ -50,16 +50,11 @@ func init() {
 func TestConsume(t *testing.T) {
 	t.Logf("%s/testConfig%+v", t.Name(), tc)
 
-	var (
-		p  = newPool(t, tc.dbCount)
-		db = &device.DB{RWC: p}
-		nc = newNATS(t, db, tc.subCount, tc.subTimeout)
-
-		firstSeen = time.Date(2009, time.November, 10, 0, 0, 0, 0, time.UTC)
-
-		ctx = t.Context()
-	)
-	g, ctx := errgroup.WithContext(ctx)
+	p := newPool(t, tc.dbCount)
+	db := &device.DB{RWC: p}
+	nc := newNATS(t, db, tc.subCount, tc.subTimeout)
+	firstSeen := time.Date(2009, time.November, 10, 0, 0, 0, 0, time.UTC)
+	g, ctx := errgroup.WithContext(t.Context())
 
 	ids, sends := send(ctx, g, db, nc, tc.pubCount, tc.pubLimit, tc.pubSize, tc.msgCount, tc.msgLimit, tc.dbSize, firstSeen)
 	polls := poll(ctx, g, ids, db, tc.pubLimit, tc.msgCount, firstSeen)
