@@ -10,18 +10,22 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/adoublef/ot/internal/device"
 	"github.com/adoublef/ot/internal/net/nats"
+	"github.com/adoublef/ot/internal/testing/wait"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 	"go.adoublef.dev/testing/is"
-	"go.adoublef.dev/testing/wait"
 	"golang.org/x/sync/errgroup"
 )
+
+var layout = "15:04:05.000"
 
 var tc struct {
 	msgCount   int
@@ -52,44 +56,69 @@ func TestConsume(t *testing.T) {
 
 	p := newPool(t, tc.dbCount)
 	db := &device.DB{RWC: p}
+
+	s := newHTTP(t, db)
 	nc := newNATS(t, db, tc.subCount, tc.subTimeout)
 	firstSeen := time.Date(2009, time.November, 10, 0, 0, 0, 0, time.UTC)
+
 	g, ctx := errgroup.WithContext(t.Context())
 
 	ids, sends := send(ctx, g, db, nc, tc.pubCount, tc.pubLimit, tc.pubSize, tc.msgCount, tc.msgLimit, tc.dbSize, firstSeen)
-	polls := poll(ctx, g, ids, db, tc.pubLimit, tc.msgCount, firstSeen)
+	polls := poll(ctx, g, ids, s, tc.pubLimit, tc.msgCount, firstSeen)
 
 	records := merge(sends, polls)
-	err := writeTo(io.Discard, records)
+
+	w :=
+		// io.Discard
+		os.Stderr
+	err := writeTo(w, records)
 	is.OK(t, cmp.Or(g.Wait(), err))
 }
 
-func poll(ctx context.Context, g *errgroup.Group, ids <-chan uuid.UUID, db *device.DB, pubLimit, msgCount int, firstSeen time.Time) <-chan []string {
+func poll(ctx context.Context, g *errgroup.Group, ids <-chan uuid.UUID, s *httptest.Server, pubLimit, msgCount int, firstSeen time.Time) <-chan []string {
 	records := make(chan []string, pubLimit)
 	g.Go(func() error {
 		defer func() { close(records) }()
+
+		c, baseURL := s.Client(), s.URL
 
 		g, ctx := errgroup.WithContext(ctx)
 		g.SetLimit(pubLimit)
 		for id := range ids {
 			g.Go(func() error {
 				err := wait.ForFunc(ctx, time.Second*60, func() error {
-					d, err := db.Device(ctx, id)
+					start := time.Now()
+					resp, err := get(ctx, c, baseURL, id)
 					if err != nil {
+						return wait.SkipRetry // failed to complete http reqeust
+					}
+					defer resp.Body.Close()
+					select {
+					case <-ctx.Done():
+						return wait.SkipRetry // context canceled
+					case records <- []string{"poll", id.String(), time.Since(start).String(), start.Format(layout)}:
+					}
+					// check the status code
+					if resp.StatusCode != 200 {
+						return fmt.Errorf("failed to fetch device")
+					}
+					// decode since its valid
+					var d struct {
+						ID       uuid.UUID `json:"id"`
+						Blob     []byte    `json:"blob,omitempty"`
+						LastSeen time.Time `json:"lastSeen"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
 						return wait.SkipRetry // not found
 					}
-					if !d.Metadata.LastSeen.Equal(firstSeen.AddDate(0, 0, msgCount)) {
+					// handle reading message at this point
+					if !d.LastSeen.Equal(firstSeen.AddDate(0, 0, msgCount)) {
 						return fmt.Errorf("device %s not ready", id)
 					}
 					return nil
 				})
 				if err != nil {
 					return err
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case records <- []string{"poll", id.String()}:
 				}
 				return nil
 			})
@@ -132,6 +161,7 @@ func send(ctx context.Context, g *errgroup.Group, db *device.DB, nc *nats.Conn, 
 				g.SetLimit(msgLimit)
 				for day := 1; day <= msgCount; day++ {
 					g.Go(func() error { // context canceled
+						start := time.Now()
 						v := struct {
 							ID       uuid.UUID `json:"id"`
 							Blob     []byte    `json:"blob"`
@@ -149,7 +179,7 @@ func send(ctx context.Context, g *errgroup.Group, db *device.DB, nc *nats.Conn, 
 						select {
 						case <-ctx.Done():
 							return ctx.Err()
-						case records <- []string{"send", id.String()}:
+						case records <- []string{"send", id.String(), time.Since(start).String(), start.Format(layout)}:
 						}
 						return nil
 					})
@@ -186,7 +216,7 @@ func devices(ctx context.Context, d *device.DB, pubCount, dbSize int, firstSeen 
 
 func writeTo(w io.Writer, records <-chan []string) error {
 	cw := csv.NewWriter(w)
-	if err := cw.Write([]string{"type", "id"}); err != nil {
+	if err := cw.Write([]string{"type", "id", "elapsed", "start"}); err != nil {
 		return err
 	}
 	for record := range records {

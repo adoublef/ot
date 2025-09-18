@@ -22,7 +22,7 @@ func Connect(url string) (*nats.Conn, error) {
 	return nats.Connect(url)
 }
 
-func Handler(nc *nats.Conn, db *device.DB, subCount int, subTimeout time.Duration) error {
+func Consume(nc *nats.Conn, db *device.DB, subCount int, subTimeout time.Duration) error {
 	if subCount < 1 {
 		panic("subCount not set")
 	}

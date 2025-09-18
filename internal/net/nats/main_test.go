@@ -4,13 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
 
 	migrate "github.com/adoublef/ot/internal/database/postgres"
 	"github.com/adoublef/ot/internal/device"
-	"github.com/adoublef/ot/internal/net/nats"
+	. "github.com/adoublef/ot/internal/net/http"
+	. "github.com/adoublef/ot/internal/net/nats"
+	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 	"github.com/nats-io/nats-server/v2/server"
@@ -21,7 +25,26 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func newNATS(t testing.TB, db *device.DB, subCount int, subTimeout time.Duration) *nats.Conn {
+func get(ctx context.Context, c *http.Client, baseURL string, id uuid.UUID) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/devices/"+id.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func newHTTP(t testing.TB, db *device.DB) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(Handler(db))
+	// handle max number of connections?
+	return s
+}
+
+func newNATS(t testing.TB, db *device.DB, subCount int, subTimeout time.Duration) *Conn {
 	t.Helper()
 
 	ns := servertest.RunServer(&server.Options{Debug: testing.Verbose()})
@@ -29,11 +52,11 @@ func newNATS(t testing.TB, db *device.DB, subCount int, subTimeout time.Duration
 
 	serverAddr := ns.ClientURL()
 
-	nc, err := nats.Connect(serverAddr)
+	nc, err := Connect(serverAddr)
 	is.OK(t, err) // Connect
 	t.Cleanup(func() { is.OK(t, nc.Drain()) /* Drain */ })
 
-	is.OK(t, nats.Handler(nc, db, subCount, subTimeout)) // Handler
+	is.OK(t, Consume(nc, db, subCount, subTimeout)) // Handler
 
 	return nc
 }
