@@ -55,6 +55,7 @@ func handlePing(db *device.DB) MsgHandler {
 	return func(ctx context.Context, msg *nats.Msg) {
 		var v struct {
 			ID       uuid.UUID `json:"id"`
+			Blob     []byte    `json:"blob"`
 			LastSeen time.Time `json:"lastSeen"`
 		}
 		err1 := json.Unmarshal(msg.Data, &v)

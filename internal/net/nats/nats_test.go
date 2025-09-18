@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -29,10 +28,11 @@ var tc struct {
 	msgLimit   int
 	pubLimit   int
 	pubCount   int
+	pubSize    int
 	subCount   int
 	subTimeout time.Duration
 	dbCount    int
-	blobSize   int
+	dbSize     int
 }
 
 func init() {
@@ -40,10 +40,11 @@ func init() {
 	flag.IntVar(&tc.msgLimit, "msg.limit", 1, "message limit")
 	flag.IntVar(&tc.pubCount, "pub.count", 1, "publisher count")
 	flag.IntVar(&tc.pubLimit, "pub.limit", 1, "publisher limit")
+	flag.IntVar(&tc.pubSize, "pub.size", 0, "publisher size")
 	flag.IntVar(&tc.subCount, "sub.count", 1, "subscriber count")
 	flag.DurationVar(&tc.subTimeout, "sub.timeout", time.Millisecond*100, "subscriber timeout")
 	flag.IntVar(&tc.dbCount, "db.count", 1, "database count")
-	flag.IntVar(&tc.blobSize, "blob.size", 0, "blob size")
+	flag.IntVar(&tc.dbSize, "db.size", 0, "database size")
 }
 
 func TestConsume(t *testing.T) {
@@ -58,10 +59,9 @@ func TestConsume(t *testing.T) {
 
 		ctx = t.Context()
 	)
-
 	g, ctx := errgroup.WithContext(ctx)
 
-	ids, sends := send(ctx, g, db, nc, tc.pubCount, tc.pubLimit, tc.msgCount, tc.msgLimit, tc.blobSize, firstSeen)
+	ids, sends := send(ctx, g, db, nc, tc.pubCount, tc.pubLimit, tc.pubSize, tc.msgCount, tc.msgLimit, tc.dbSize, firstSeen)
 	polls := poll(ctx, g, ids, db, tc.pubLimit, tc.msgCount, firstSeen)
 
 	records := merge(sends, polls)
@@ -104,7 +104,17 @@ func poll(ctx context.Context, g *errgroup.Group, ids <-chan uuid.UUID, db *devi
 	return records
 }
 
-func send(ctx context.Context, g *errgroup.Group, db *device.DB, nc *nats.Conn, pubCount, pubLimit, msgCount, msgLimit, blobSize int, firstSeen time.Time) (<-chan uuid.UUID, <-chan []string) {
+func send(ctx context.Context, g *errgroup.Group, db *device.DB, nc *nats.Conn, pubCount, pubLimit, pubSize, msgCount, msgLimit, dbSize int, firstSeen time.Time) (<-chan uuid.UUID, <-chan []string) {
+	// generate a blob that is shared amongst all publishers
+	// default max size for NATS is 1mib (can i convert)
+	// panic at 4mb
+	buf := make([]byte, pubSize)
+	n, err := rand.Read(buf)
+	if err != nil {
+		panic("failed to read")
+	}
+	buf = buf[:n]
+
 	ids := make(chan uuid.UUID, pubLimit)
 	records := make(chan []string, pubLimit*msgLimit)
 	g.Go(func() error {
@@ -116,7 +126,7 @@ func send(ctx context.Context, g *errgroup.Group, db *device.DB, nc *nats.Conn, 
 		// how many should we process at once?
 		// with 10 devices do we need 10 routines? maybe not
 		g.SetLimit(pubLimit)
-		for id, err := range devices(ctx, db, pubCount, blobSize, firstSeen) {
+		for id, err := range devices(ctx, db, pubCount, dbSize, firstSeen) {
 			// we want to check context before the next stage
 			// more verbose, but best we can do when not using jetstream
 			g.Go(func() error {
@@ -129,10 +139,11 @@ func send(ctx context.Context, g *errgroup.Group, db *device.DB, nc *nats.Conn, 
 					g.Go(func() error { // context canceled
 						v := struct {
 							ID       uuid.UUID `json:"id"`
+							Blob     []byte    `json:"blob"`
 							LastSeen time.Time `json:"lastSeen"`
 						}{
-							ID: id,
-							// greater than -n.msg=1000000 and we get a marshalJson error with time
+							ID:       id,
+							Blob:     buf,
 							LastSeen: firstSeen.AddDate(0, 0, day),
 						}
 						p, err1 := json.Marshal(v)
@@ -161,20 +172,16 @@ func send(ctx context.Context, g *errgroup.Group, db *device.DB, nc *nats.Conn, 
 	return ids, records
 }
 
-func devices(ctx context.Context, d *device.DB, pubCount, blobSize int, firstSeen time.Time) iter.Seq2[uuid.UUID, error] {
-	buf := make([]byte, blobSize)
+func devices(ctx context.Context, d *device.DB, pubCount, dbSize int, firstSeen time.Time) iter.Seq2[uuid.UUID, error] {
+	buf := make([]byte, dbSize)
 	n, err := rand.Read(buf)
 	if err != nil {
 		panic("failed to read")
 	}
-	encodedLen := base64.StdEncoding.EncodedLen(len(buf))
-	blob := make([]byte, encodedLen)
-	base64.StdEncoding.Encode(blob, buf[:n])
-	// 3mb takes longer to query & modify under 100ms
-	// 4mb takes longer to query & modify under 250ms
+	buf = buf[:n]
 	return func(yield func(uuid.UUID, error) bool) {
 		for range pubCount {
-			id, err := d.AddDevice(ctx, device.Metadata{Blob: blob, LastSeen: firstSeen})
+			id, err := d.AddDevice(ctx, device.Metadata{Blob: buf, LastSeen: firstSeen})
 			if !yield(id, err) {
 				return
 			}
